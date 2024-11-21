@@ -185,6 +185,64 @@ def compute_gaussian_splat_map_single_scale(mask, covariance_matrices, amplitude
 
     return S  # [H, W]
 
+# ============================
+# Metric Functions
+# ============================
+
+def compute_mse(img1, img2):
+    mse = F.mse_loss(img1, img2)
+    return mse.item()
+
+def compute_psnr(img1, img2):
+    mse = F.mse_loss(img1, img2)
+    if mse == 0:
+        return float('inf')
+    max_pixel = 2.0  # Pixel values are in [-1,1], so the dynamic range is 2
+    psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
+    return psnr.item()
+
+def compute_ssim(img1, img2):
+    # img1 and img2: [B, C, H, W], values in [-1, 1]
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    img1 = img1 / 2 + 0.5  # Normalize to [0,1]
+    img2 = img2 / 2 + 0.5  # Normalize to [0,1]
+
+    mu1 = F.avg_pool2d(img1, 3, 1, padding=1)
+    mu2 = F.avg_pool2d(img2, 3, 1, padding=1)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.avg_pool2d(img1 * img1, 3, 1, padding=1) - mu1_sq
+    sigma2_sq = F.avg_pool2d(img2 * img2, 3, 1, padding=1) - mu2_sq
+    sigma12 = F.avg_pool2d(img1 * img2, 3, 1, padding=1) - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    ssim = ssim_map.mean()
+    return ssim.item()
+
+def compute_mse_masked(img1, img2, mask):
+    # img1 and img2: [B, C, H, W]
+    # mask: [B, 1, H, W]
+    diff = img1 - img2
+    diff = diff * (1 - mask)  # Inpainted regions
+    mse = torch.sum(diff ** 2, dim=[1,2,3]) / torch.sum(1 - mask, dim=[1,2,3])  # Shape [B]
+    mse = mse.mean()
+    return mse.item()
+
+def compute_psnr_masked(img1, img2, mask):
+    mse = compute_mse_masked(img1, img2, mask)
+    if mse == 0:
+        return float('inf')
+    max_pixel = 2.0
+    psnr = 20 * torch.log10(max_pixel / torch.sqrt(torch.tensor(mse)))
+    return psnr.item()
 
 # ============================
 # Main Training Function
@@ -442,62 +500,74 @@ def main(rank, world_size):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
+                # Compute metrics
+                mse_batch = compute_mse_masked(x0_pred, real_images, masks)
+                psnr_batch = compute_psnr_masked(x0_pred, real_images, masks)
+                ssim_batch = compute_ssim(x0_pred, real_images)
+
                 # Update progress bar only on rank 0
                 if rank == 0:
                     pbar.set_postfix({
                         'Total Loss': f'{total_loss.item():.4f}',
-                        'Noise Loss': f'{noise_loss.item():.4f}',
-                        'Rec Loss': f'{rec_loss.item():.4f}',
-                        'Perc Loss': f'{perc_loss.item():.4f}',
-                        'Style Loss': f'{style_loss.item():.4f}',
-                        'TV Loss': f'{tv_loss.item():.4f}',
+                        'PSNR': f'{psnr_batch:.2f}',
+                        'SSIM': f'{ssim_batch:.4f}',
                     })
 
             # At the end of each epoch, only rank 0 outputs statistics, saves plots, and saves the model
             if rank == 0:
+                # Generate images using reverse diffusion
+                n_images = 4  # Number of images to generate
+
+                # Get samples for visualization
+                real_images_sample = real_images[:n_images]
+                masks_sample = masks[:n_images]
+                incomplete_images_sample = incomplete_images[:n_images]
+                S_norm_sample = S_norm[:n_images]
+                edge_maps_sample = edge_maps[:n_images]
+                attention_map_sample = attention_map[:n_images]
+
+                # Initialize noisy images
+                generated_images = torch.randn_like(real_images_sample).to(device)
+
+                # Start reverse diffusion process
+                scheduler.set_timesteps(num_inference_steps)
+
+                # Retrieve alphas and betas for the timesteps
+                alphas = scheduler.alphas_cumprod.to(device)
+                sqrt_alphas = torch.sqrt(alphas)
+                sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
+
+                for t in scheduler.timesteps:
+                    timesteps_sample = torch.tensor([t] * n_images, device=device).long()
+
+                    # Prepare model inputs
+                    with torch.no_grad():
+                        model_inputs = torch.cat([generated_images, masks_sample, S_norm_sample, edge_maps_sample, attention_map_sample], dim=1)
+                        # Predict noise residual
+                        noise_pred = model(model_inputs, timesteps_sample).sample
+
+                    # Compute previous image
+                    generated_images = scheduler.step(noise_pred, t, generated_images).prev_sample
+
+                    # Enforce known pixels
+                    generated_images = generated_images * (1 - masks_sample) + real_images_sample * masks_sample
+
+                # Compute evaluation metrics
+                with torch.no_grad():
+                    mse_epoch = compute_mse(generated_images, real_images_sample)
+                    psnr_epoch = compute_psnr(generated_images, real_images_sample)
+                    ssim_epoch = compute_ssim(generated_images, real_images_sample)
+
                 # Logging
                 with open('log.txt', 'a') as f:
-                    f.write(f"Epoch [{epoch+1}/{num_epochs}], Total Loss: {total_loss.item():.4f}\n")
+                    f.write(f"Epoch [{epoch+1}/{num_epochs}], MSE: {mse_epoch:.6f}, PSNR: {psnr_epoch:.4f}, SSIM: {ssim_epoch:.4f}\n")
+                    # You can also include other information if you want
+
+                # Optional: print the metrics
+                print(f"Epoch [{epoch+1}/{num_epochs}], MSE: {mse_epoch:.6f}, PSNR: {psnr_epoch:.4f}, SSIM: {ssim_epoch:.4f}")
 
                 # Save images every 10 epochs
                 if (epoch + 1) % 10 == 0:
-                    # Generate images using reverse diffusion
-                    n_images = 4  # Number of images to generate
-
-                    # Get samples for visualization
-                    real_images_sample = real_images[:n_images]
-                    masks_sample = masks[:n_images]
-                    incomplete_images_sample = incomplete_images[:n_images]
-                    S_norm_sample = S_norm[:n_images]
-                    edge_maps_sample = edge_maps[:n_images]
-                    attention_map_sample = attention_map[:n_images]
-
-                    # Initialize noisy images
-                    generated_images = torch.randn_like(real_images_sample).to(device)
-
-                    # Start reverse diffusion process
-                    scheduler.set_timesteps(num_inference_steps)
-
-                    # Retrieve alphas and betas for the timesteps
-                    alphas = scheduler.alphas_cumprod.to(device)
-                    sqrt_alphas = torch.sqrt(alphas)
-                    sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
-
-                    for t in scheduler.timesteps:
-                        timesteps_sample = torch.tensor([t] * n_images, device=device).long()
-
-                        # Prepare model inputs
-                        with torch.no_grad():
-                            model_inputs = torch.cat([generated_images, masks_sample, S_norm_sample, edge_maps_sample, attention_map_sample], dim=1)
-                            # Predict noise residual
-                            noise_pred = model(model_inputs, timesteps_sample).sample
-
-                        # Compute previous image
-                        generated_images = scheduler.step(noise_pred, t, generated_images).prev_sample
-
-                        # Enforce known pixels
-                        generated_images = generated_images * (1 - masks_sample) + real_images_sample * masks_sample
-
                     # Save generated images
                     for i in range(n_images):
                         fig, axs = plt.subplots(1, 3, figsize=(12, 4))
