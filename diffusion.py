@@ -5,34 +5,72 @@ import torchvision
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, DistributedSampler
 import numpy as np
-from tqdm import tqdm
-import os
 import random
-
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-
 import torch.nn.functional as F
-# For plotting
 import matplotlib.pyplot as plt
-# Import diffusion model utilities
 from diffusers import DDPMScheduler, UNet2DModel
 import scipy.ndimage
+import os
+from tqdm import tqdm
 
 # ============================
 # Helper Functions
 # ============================
 
-def generate_random_mask(H, W, target_percent=1.0):
+def generate_random_mask(H, W, target_percent=0.2):
     """
-    Generate a random mask that covers approximately target_percent of the image.
-    For target_percent=1.0, the mask will cover the entire image.
+    Generate a random brush stroke mask that covers approximately target_percent of the image.
     Returns:
         mask_np (numpy.ndarray): A 2D numpy array representing the mask.
     """
-    mask = np.zeros((H, W), dtype=np.float32)
-    return mask
+    from PIL import Image, ImageDraw
+
+    mask = Image.new('L', (W, H), color=255)  # White image (255)
+    draw = ImageDraw.Draw(mask)
+
+    # Keep adding strokes until the target percent of the image is masked
+    while True:
+        num_strokes = random.randint(1, 4)
+        for _ in range(num_strokes):
+            # Random starting point
+            start_x = random.randint(0, W)
+            start_y = random.randint(0, H)
+
+            # Random brush properties
+            brush_width = random.randint(3, 7)  # Adjusted for smaller images
+            num_vertices = random.randint(2, 5)
+            angles = np.random.uniform(0, 2 * np.pi, size=(num_vertices,))
+            lengths = np.random.uniform(5, 15, size=(num_vertices,))  # Adjusted for smaller images
+
+            # Generate stroke points
+            points = [(start_x, start_y)]
+            for angle, length in zip(angles, lengths):
+                dx = int(length * np.cos(angle))
+                dy = int(length * np.sin(angle))
+                new_x = np.clip(points[-1][0] + dx, 0, W - 1)
+                new_y = np.clip(points[-1][1] + dy, 0, H - 1)
+                points.append((new_x, new_y))
+
+            # Draw the stroke
+            draw.line(points, fill=0, width=brush_width, joint='curve')
+
+            # Optional: add circles at points to simulate brush pressure
+            for point in points:
+                radius = brush_width // 2
+                bbox = [point[0] - radius, point[1] - radius,
+                        point[0] + radius, point[1] + radius]
+                draw.ellipse(bbox, fill=0)
+
+        # Convert mask to numpy array and calculate masked percentage
+        mask_np = np.array(mask) / 255.0  # 1 for known regions (white), 0 for masked regions (black)
+        percent_masked = 1.0 - np.mean(mask_np)
+        if percent_masked >= target_percent:
+            break
+
+    return mask_np
 
 def compute_covariance_matrices(E_x, E_y, mask, epsilon=1e-5):
     """
@@ -41,7 +79,7 @@ def compute_covariance_matrices(E_x, E_y, mask, epsilon=1e-5):
         covariance_matrices (torch.Tensor): Covariance matrices for each pixel.
     """
     H, W = mask.shape
-    window_size = 3  # Adjusted window size for smaller images
+    window_size = 3
     pad = window_size // 2
 
     # Structure tensor components
@@ -66,8 +104,8 @@ def compute_covariance_matrices(E_x, E_y, mask, epsilon=1e-5):
     # Covariance matrices
     covariance_matrices = torch.stack([inv_J11, inv_J12, inv_J12, inv_J22], dim=-1).view(H, W, 2, 2)
 
-    # Handle division by zero in case of full mask
-    covariance_matrices[torch.isnan(covariance_matrices)] = 0.0
+    # Apply mask
+    covariance_matrices = covariance_matrices * mask.unsqueeze(-1).unsqueeze(-1)
 
     return covariance_matrices  # [H, W, 2, 2]
 
@@ -250,7 +288,7 @@ def main(rank, world_size):
             in_channels=7,   # Number of input channels
             out_channels=3,  # RGB channels
             layers_per_block=2,
-            block_out_channels=(128, 256, 512, 512),  # Increased number of channels
+            block_out_channels=(128, 256, 256, 512),
             down_block_types=(
                 "DownBlock2D",        # 32x32 -> 16x16
                 "DownBlock2D",        # 16x16 -> 8x8
@@ -322,11 +360,16 @@ def main(rank, world_size):
                 real_images = real_images.to(device, non_blocking=True)
                 batch_size, C, H, W = real_images.size()
 
-                # Generate masks that cover the entire image
-                masks = torch.zeros(batch_size, 1, H, W).to(device)
+                # Generate masks
+                masks = []
+                for _ in range(batch_size):
+                    mask = generate_random_mask(H, W)
+                    masks.append(mask)
+                masks = np.stack(masks, axis=0)
+                masks = torch.from_numpy(masks).unsqueeze(1).float().to(device, non_blocking=True)  # [B, 1, H, W]
 
                 # Incomplete images (masked images)
-                incomplete_images = real_images * masks  # All zeros since masks are zeros
+                incomplete_images = real_images * masks  # Known regions remain, masked regions are zero
 
                 # Compute gradients
                 gray_images = torch.mean(real_images, dim=1, keepdim=True)
@@ -375,15 +418,15 @@ def main(rank, world_size):
                 # Compute the predicted noise residual
                 epsilon_theta = model_output
 
-                # Noise prediction loss computed over masked regions (which is the whole image now)
-                masks_expanded_C = torch.ones_like(masks)  # Since masks are zeros, (1 - masks) is ones
+                # Noise prediction loss computed over masked regions
+                masks_expanded_C = (1 - masks)  # [B, 1, H, W]
                 noise_diff = epsilon_theta - noise
                 noise_loss = criterion_mse(epsilon_theta * masks_expanded_C, noise * masks_expanded_C)
 
                 # Reconstructed image estimate
                 x0_pred = (noisy_incomplete_images - sqrt_one_minus_alpha_t * epsilon_theta) / sqrt_alpha_t
 
-                # Reconstruction loss over masked regions (entire image)
+                # Reconstruction loss over masked regions
                 rec_loss = criterion_l1(x0_pred * masks_expanded_C, real_images * masks_expanded_C)
 
                 # Perceptual loss over masked regions
@@ -461,8 +504,8 @@ def main(rank, world_size):
 
                 # Compute metrics
                 with torch.no_grad():
-                    mse_batch = compute_mse(x0_pred, real_images)
-                    psnr_batch = compute_psnr(x0_pred, real_images)
+                    mse_batch = compute_mse_masked(x0_pred, real_images, masks)
+                    psnr_batch = compute_psnr_masked(x0_pred, real_images, masks)
                     ssim_batch = compute_ssim(x0_pred, real_images)
 
                 # Update progress bar only on rank 0
@@ -474,7 +517,7 @@ def main(rank, world_size):
                     })
 
             # At the end of each epoch, only rank 0 outputs statistics, saves plots, and saves the model
-            if rank == 0:
+            if rank == 0 and (epoch + 1) % 5 == 0:
                 # Generate images using reverse diffusion
                 n_images = 4  # Number of images to generate
 
@@ -505,57 +548,58 @@ def main(rank, world_size):
                     # Compute previous image
                     generated_images = scheduler.step(noise_pred, t, generated_images).prev_sample
 
+                    # Enforce known pixels
+                    generated_images = generated_images * (1 - masks_sample) + real_images_sample * masks_sample
+
                 # Compute evaluation metrics
                 with torch.no_grad():
-                    mse_epoch = compute_mse(generated_images, real_images_sample)
-                    psnr_epoch = compute_psnr(generated_images, real_images_sample)
+                    mse_epoch = compute_mse_masked(generated_images, real_images_sample, masks_sample)
+                    psnr_epoch = compute_psnr_masked(generated_images, real_images_sample, masks_sample)
                     ssim_epoch = compute_ssim(generated_images, real_images_sample)
 
                 # Logging
                 with open('log.txt', 'a') as f:
                     f.write(f"Epoch [{epoch+1}/{num_epochs}], MSE: {mse_epoch:.6f}, PSNR: {psnr_epoch:.4f}, SSIM: {ssim_epoch:.4f}\n")
 
-                # Optional: print the metrics
+                # Print the metrics
                 print(f"Epoch [{epoch+1}/{num_epochs}], MSE: {mse_epoch:.6f}, PSNR: {psnr_epoch:.4f}, SSIM: {ssim_epoch:.4f}")
 
-                # Save images every 5 epochs
-                if (epoch + 1) % 5 == 0:
-                    # Save generated images
-                    for i in range(n_images):
-                        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-                        # Original image
-                        original = real_images_sample[i].cpu().permute(1, 2, 0).numpy()
-                        original = (original * 0.5 + 0.5).clip(0, 1)
-                        axs[0].imshow(original)
-                        axs[0].set_title('Original Image')
-                        axs[0].axis('off')
+                # Save images
+                for i in range(n_images):
+                    fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+                    # Original image
+                    original = real_images_sample[i].cpu().permute(1, 2, 0).numpy()
+                    original = (original * 0.5 + 0.5).clip(0, 1)
+                    axs[0].imshow(original)
+                    axs[0].set_title('Original Image')
+                    axs[0].axis('off')
 
-                        # Masked image
-                        masked = incomplete_images_sample[i].cpu().permute(1, 2, 0).numpy()
-                        masked = (masked * 0.5 + 0.5).clip(0, 1)
-                        axs[1].imshow(masked)
-                        axs[1].set_title('Masked Image')
-                        axs[1].axis('off')
+                    # Masked image
+                    masked = incomplete_images_sample[i].cpu().permute(1, 2, 0).numpy()
+                    masked = (masked * 0.5 + 0.5).clip(0, 1)
+                    axs[1].imshow(masked)
+                    axs[1].set_title('Masked Image')
+                    axs[1].axis('off')
 
-                        # Reconstructed image
-                        reconstructed = generated_images[i].cpu().permute(1, 2, 0).numpy()
-                        reconstructed = (reconstructed * 0.5 + 0.5).clip(0, 1)
-                        axs[2].imshow(reconstructed)
-                        axs[2].set_title('Reconstructed Image')
-                        axs[2].axis('off')
+                    # Reconstructed image
+                    reconstructed = generated_images[i].cpu().permute(1, 2, 0).numpy()
+                    reconstructed = (reconstructed * 0.5 + 0.5).clip(0, 1)
+                    axs[2].imshow(reconstructed)
+                    axs[2].set_title('Reconstructed Image')
+                    axs[2].axis('off')
 
-                        plt.tight_layout()
-                        # Save the plot to the ./plots directory
-                        plt.savefig(f'./plots/epoch_{epoch+1}_image_{i+1}.png')
-                        plt.close()
+                    plt.tight_layout()
+                    # Save the plot to the ./plots directory
+                    plt.savefig(f'./plots/epoch_{epoch+1}_image_{i+1}.png')
+                    plt.close()
 
-                    # Save the model every 5 epochs
-                    model_dir = 'models'
-                    os.makedirs(model_dir, exist_ok=True)
-                    model_path = os.path.join(model_dir, f'model_epoch_{epoch+1}.pth')
-                    # Save model.module.state_dict() to account for DDP wrapping
-                    torch.save(model.module.state_dict(), model_path)
-                    print(f"Saved model at {model_path}")
+                # Save the model
+                model_dir = 'models'
+                os.makedirs(model_dir, exist_ok=True)
+                model_path = os.path.join(model_dir, f'model_epoch_{epoch+1}.pth')
+                # Save model.module.state_dict() to account for DDP wrapping
+                torch.save(model.module.state_dict(), model_path)
+                print(f"Saved model at {model_path}")
 
         # Synchronize all processes
         dist.barrier()
