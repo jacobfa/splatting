@@ -24,63 +24,19 @@ import scipy.ndimage
 # Helper Functions
 # ============================
 
-def generate_random_mask(H, W, target_percent=0.2):
+def generate_random_mask(H, W, target_percent=1.0):
     """
-    Generate a random brush stroke mask that covers approximately target_percent of the image.
-
+    Generate a random mask that covers approximately target_percent of the image.
+    For target_percent=1.0, the mask will cover the entire image.
     Returns:
         mask_np (numpy.ndarray): A 2D numpy array representing the mask.
     """
-    from PIL import Image, ImageDraw
-
-    mask = Image.new('L', (W, H), color=255)  # White image (255)
-    draw = ImageDraw.Draw(mask)
-
-    # Keep adding strokes until the target percent of the image is masked
-    while True:
-        num_strokes = random.randint(1, 4)
-        for _ in range(num_strokes):
-            # Random starting point
-            start_x = random.randint(0, W)
-            start_y = random.randint(0, H)
-
-            # Random brush properties
-            brush_width = random.randint(3, 7)  # Adjusted for smaller images
-            num_vertices = random.randint(2, 5)
-            angles = np.random.uniform(0, 2 * np.pi, size=(num_vertices,))
-            lengths = np.random.uniform(5, 15, size=(num_vertices,))  # Adjusted for smaller images
-
-            # Generate stroke points
-            points = [(start_x, start_y)]
-            for angle, length in zip(angles, lengths):
-                dx = int(length * np.cos(angle))
-                dy = int(length * np.sin(angle))
-                new_x = np.clip(points[-1][0] + dx, 0, W - 1)
-                new_y = np.clip(points[-1][1] + dy, 0, H - 1)
-                points.append((new_x, new_y))
-
-            # Draw the stroke
-            draw.line(points, fill=0, width=brush_width, joint='curve')
-
-            # Optional: add circles at points to simulate brush pressure
-            for point in points:
-                radius = brush_width // 2
-                bbox = [point[0] - radius, point[1] - radius,
-                        point[0] + radius, point[1] + radius]
-                draw.ellipse(bbox, fill=0)
-
-        # Convert mask to numpy array and calculate masked percentage
-        mask_np = np.array(mask) / 255.0  # 1 for known regions (white), 0 for masked regions (black)
-        percent_masked = 1.0 - np.mean(mask_np)
-        if percent_masked >= target_percent:
-            break
-
-    return mask_np
+    mask = np.zeros((H, W), dtype=np.float32)
+    return mask
 
 def compute_covariance_matrices(E_x, E_y, mask, epsilon=1e-5):
     """
     Estimate the covariance matrix based on local gradients.
-
     Returns:
         covariance_matrices (torch.Tensor): Covariance matrices for each pixel.
     """
@@ -110,15 +66,14 @@ def compute_covariance_matrices(E_x, E_y, mask, epsilon=1e-5):
     # Covariance matrices
     covariance_matrices = torch.stack([inv_J11, inv_J12, inv_J12, inv_J22], dim=-1).view(H, W, 2, 2)
 
-    # Apply mask
-    covariance_matrices = covariance_matrices * mask.unsqueeze(-1).unsqueeze(-1)
+    # Handle division by zero in case of full mask
+    covariance_matrices[torch.isnan(covariance_matrices)] = 0.0
 
     return covariance_matrices  # [H, W, 2, 2]
 
 def compute_amplitude_map(mask, beta=0.1):
     """
     Compute amplitude based on distance to known regions.
-
     Returns:
         amplitude_map (torch.Tensor): Amplitude map.
     """
@@ -132,7 +87,6 @@ def compute_amplitude_map(mask, beta=0.1):
 def compute_gaussian_splat_map(mask, covariance_matrices, amplitude_map, scales=[1, 2, 4]):
     """
     Generate the Gaussian splat map with multi-scale integration.
-
     Returns:
         S_norm (torch.Tensor): Normalized Gaussian splat map.
     """
@@ -153,7 +107,6 @@ def compute_gaussian_splat_map(mask, covariance_matrices, amplitude_map, scales=
 def compute_gaussian_splat_map_single_scale(mask, covariance_matrices, amplitude_map):
     """
     Compute Gaussian splat map at a single scale.
-
     Returns:
         S (torch.Tensor): Gaussian splat map.
     """
@@ -161,7 +114,7 @@ def compute_gaussian_splat_map_single_scale(mask, covariance_matrices, amplitude
     grid_y, grid_x = torch.meshgrid(torch.arange(H, device=mask.device), torch.arange(W, device=mask.device), indexing='ij')
     grid = torch.stack([grid_x, grid_y], dim=-1).float()  # [H, W, 2]
 
-    indices = torch.nonzero(mask == 0).to(mask.device)  # Only masked regions
+    indices = torch.nonzero((1 - mask).bool()).to(mask.device)  # Only masked regions
     if indices.size(0) == 0:
         return torch.zeros(H, W).to(mask.device)
 
@@ -272,6 +225,7 @@ def main(rank, world_size):
 
         # Define transform
         transform = transforms.Compose([
+            transforms.Resize(32),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)  # Normalize to [-1, 1]
         ])
@@ -280,7 +234,7 @@ def main(rank, world_size):
 
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
-        train_loader = DataLoader(train_dataset, batch_size=128, sampler=train_sampler, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=64, sampler=train_sampler, num_workers=4, pin_memory=True)
 
         # Define Sobel kernels once
         sobel_kernel_x = torch.tensor([[[[-1, 0, 1],
@@ -291,23 +245,22 @@ def main(rank, world_size):
                                          [1, 2, 1]]]], dtype=torch.float32).to(device)
 
         # Initialize models and wrap with DDP
-        # Adjusted model capacity by reducing the number of layers
         model = UNet2DModel(
             sample_size=32,  # CIFAR-10 images are 32x32
             in_channels=7,   # Number of input channels
             out_channels=3,  # RGB channels
-            layers_per_block=2,  # Adjusted layers per block
-            block_out_channels=(128, 256, 256, 512),  # Adjusted number of channels
+            layers_per_block=2,
+            block_out_channels=(128, 256, 512, 512),  # Increased number of channels
             down_block_types=(
                 "DownBlock2D",        # 32x32 -> 16x16
-                "AttnDownBlock2D",    # 16x16 -> 8x8
+                "DownBlock2D",        # 16x16 -> 8x8
                 "DownBlock2D",        # 8x8 -> 4x4
                 "DownBlock2D",        # 4x4 -> 2x2
             ),
             up_block_types=(
                 "UpBlock2D",          # 2x2 -> 4x4
                 "UpBlock2D",          # 4x4 -> 8x8
-                "AttnUpBlock2D",      # 8x8 -> 16x16
+                "UpBlock2D",          # 8x8 -> 16x16
                 "UpBlock2D",          # 16x16 -> 32x32
             ),
         ).to(device)
@@ -325,10 +278,10 @@ def main(rank, world_size):
         scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device).float()
 
         # Set number of inference steps
-        num_inference_steps = 50  # You can adjust this value as needed
+        num_inference_steps = 100  # Increased the number of inference steps
 
         # Adjusted learning rate for better convergence
-        optimizer = optim.AdamW(model.parameters(), lr=2e-4)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
         # Load VGG19 for perceptual and style losses
         vgg_model = torchvision.models.vgg19(pretrained=True).features.to(device).eval()
@@ -354,7 +307,7 @@ def main(rank, world_size):
         lambda_noise = 1.0
         lambda_rec = 1.0
         lambda_perc = 0.1
-        lambda_style = 250.0
+        lambda_style = 1.0  # Reduced lambda_style
         lambda_tv = 0.1
 
         for epoch in range(num_epochs):
@@ -369,16 +322,11 @@ def main(rank, world_size):
                 real_images = real_images.to(device, non_blocking=True)
                 batch_size, C, H, W = real_images.size()
 
-                # Generate masks
-                masks = []
-                for _ in range(batch_size):
-                    mask = generate_random_mask(H, W)
-                    masks.append(mask)
-                masks = np.stack(masks, axis=0)
-                masks = torch.from_numpy(masks).unsqueeze(1).float().to(device, non_blocking=True)  # [B, 1, H, W]
+                # Generate masks that cover the entire image
+                masks = torch.zeros(batch_size, 1, H, W).to(device)
 
                 # Incomplete images (masked images)
-                incomplete_images = real_images * masks  # Known regions remain, masked regions are zero
+                incomplete_images = real_images * masks  # All zeros since masks are zeros
 
                 # Compute gradients
                 gray_images = torch.mean(real_images, dim=1, keepdim=True)
@@ -427,15 +375,15 @@ def main(rank, world_size):
                 # Compute the predicted noise residual
                 epsilon_theta = model_output
 
-                # Noise prediction loss computed over masked regions
-                masks_expanded_C = (1 - masks)  # [B, 1, H, W]
+                # Noise prediction loss computed over masked regions (which is the whole image now)
+                masks_expanded_C = torch.ones_like(masks)  # Since masks are zeros, (1 - masks) is ones
                 noise_diff = epsilon_theta - noise
                 noise_loss = criterion_mse(epsilon_theta * masks_expanded_C, noise * masks_expanded_C)
 
                 # Reconstructed image estimate
                 x0_pred = (noisy_incomplete_images - sqrt_one_minus_alpha_t * epsilon_theta) / sqrt_alpha_t
 
-                # Reconstruction loss over masked regions
+                # Reconstruction loss over masked regions (entire image)
                 rec_loss = criterion_l1(x0_pred * masks_expanded_C, real_images * masks_expanded_C)
 
                 # Perceptual loss over masked regions
@@ -513,8 +461,8 @@ def main(rank, world_size):
 
                 # Compute metrics
                 with torch.no_grad():
-                    mse_batch = compute_mse_masked(x0_pred, real_images, masks)
-                    psnr_batch = compute_psnr_masked(x0_pred, real_images, masks)
+                    mse_batch = compute_mse(x0_pred, real_images)
+                    psnr_batch = compute_psnr(x0_pred, real_images)
                     ssim_batch = compute_ssim(x0_pred, real_images)
 
                 # Update progress bar only on rank 0
@@ -557,9 +505,6 @@ def main(rank, world_size):
                     # Compute previous image
                     generated_images = scheduler.step(noise_pred, t, generated_images).prev_sample
 
-                    # Enforce known pixels
-                    generated_images = generated_images * (1 - masks_sample) + real_images_sample * masks_sample
-
                 # Compute evaluation metrics
                 with torch.no_grad():
                     mse_epoch = compute_mse(generated_images, real_images_sample)
@@ -569,7 +514,6 @@ def main(rank, world_size):
                 # Logging
                 with open('log.txt', 'a') as f:
                     f.write(f"Epoch [{epoch+1}/{num_epochs}], MSE: {mse_epoch:.6f}, PSNR: {psnr_epoch:.4f}, SSIM: {ssim_epoch:.4f}\n")
-                    # You can also include other information if you want
 
                 # Optional: print the metrics
                 print(f"Epoch [{epoch+1}/{num_epochs}], MSE: {mse_epoch:.6f}, PSNR: {psnr_epoch:.4f}, SSIM: {ssim_epoch:.4f}")
