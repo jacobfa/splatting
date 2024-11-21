@@ -318,8 +318,8 @@ def main(rank, world_size):
         # Set number of inference steps
         num_inference_steps = 50  # You can adjust this value as needed
 
-        # Define optimizer with reduced learning rate
-        optimizer = optim.AdamW(model.parameters(), lr=2e-4)
+        # Reduce learning rate to slow down learning
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
         # Load VGG19 for perceptual and style losses
         vgg_model = torchvision.models.vgg19(pretrained=True).features.to(device).eval()
@@ -339,7 +339,8 @@ def main(rank, world_size):
             os.makedirs('./plots', exist_ok=True)
 
         # Training loop
-        num_epochs = 200  # Adjust the number of epochs as needed
+        num_epochs = 400  # Increased the number of epochs
+
         lambda_noise = 1.0
         lambda_rec = 5.0
         lambda_perc = 0.5
