@@ -218,23 +218,6 @@ def compute_ssim(img1, img2):
     ssim = ssim_map.mean()
     return ssim.item()
 
-def compute_mse_masked(img1, img2, mask):
-    # img1 and img2: [B, C, H, W]
-    # mask: [B, 1, H, W]
-    diff = img1 - img2
-    diff = diff * (1 - mask)  # Inpainted regions
-    mse = torch.sum(diff ** 2, dim=[1,2,3]) / torch.sum(1 - mask, dim=[1,2,3])  # Shape [B]
-    mse = mse.mean()
-    return mse.item()
-
-def compute_psnr_masked(img1, img2, mask):
-    mse = compute_mse_masked(img1, img2, mask)
-    if mse == 0:
-        return float('inf')
-    max_pixel = 2.0
-    psnr = 20 * torch.log10(max_pixel / torch.sqrt(torch.tensor(mse)))
-    return psnr.item()
-
 # ============================
 # Main Training Function
 # ============================
@@ -272,7 +255,7 @@ def main(rank, world_size):
 
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
-        train_loader = DataLoader(train_dataset, batch_size=64, sampler=train_sampler, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=128, sampler=train_sampler, num_workers=4, pin_memory=True)
 
         # Define Sobel kernels once
         sobel_kernel_x = torch.tensor([[[[-1, 0, 1],
@@ -287,8 +270,8 @@ def main(rank, world_size):
             sample_size=32,  # CIFAR-10 images are 32x32
             in_channels=7,   # Number of input channels
             out_channels=3,  # RGB channels
-            layers_per_block=2,
-            block_out_channels=(128, 256, 256, 512),
+            layers_per_block=3,  # Increased layers per block for better learning
+            block_out_channels=(64, 128, 256, 512),  # Adjusted model capacity
             down_block_types=(
                 "DownBlock2D",        # 32x32 -> 16x16
                 "DownBlock2D",        # 16x16 -> 8x8
@@ -316,10 +299,10 @@ def main(rank, world_size):
         scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device).float()
 
         # Set number of inference steps
-        num_inference_steps = 100  # Increased the number of inference steps
+        num_inference_steps = 50  # Reduced the number of inference steps for faster inference
 
-        # Adjusted learning rate for better convergence
-        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+        # Adjusted learning rate for faster learning
+        optimizer = optim.AdamW(model.parameters(), lr=2e-4)
 
         # Load VGG19 for perceptual and style losses
         vgg_model = torchvision.models.vgg19(pretrained=True).features.to(device).eval()
@@ -339,13 +322,13 @@ def main(rank, world_size):
             os.makedirs('./plots', exist_ok=True)
 
         # Training loop
-        num_epochs = 300  # Training for 300 epochs
+        num_epochs = 150  # Reduced number of epochs for faster training
 
         # Loss weights adjusted for better balance
         lambda_noise = 1.0
         lambda_rec = 1.0
         lambda_perc = 0.1
-        lambda_style = 1.0  # Reduced lambda_style
+        lambda_style = 1.0
         lambda_tv = 0.1
 
         for epoch in range(num_epochs):
@@ -415,22 +398,20 @@ def main(rank, world_size):
                 optimizer.zero_grad()
                 model_output = model(model_inputs, timesteps).sample  # [B, 3, H, W]
 
-                # Compute the predicted noise residual
+                # Compute the predicted noise residual over the whole image
                 epsilon_theta = model_output
 
-                # Noise prediction loss computed over masked regions
-                masks_expanded_C = (1 - masks)  # [B, 1, H, W]
-                noise_diff = epsilon_theta - noise
-                noise_loss = criterion_mse(epsilon_theta * masks_expanded_C, noise * masks_expanded_C)
+                # Noise prediction loss computed over the whole image
+                noise_loss = criterion_mse(epsilon_theta, noise)
 
                 # Reconstructed image estimate
                 x0_pred = (noisy_incomplete_images - sqrt_one_minus_alpha_t * epsilon_theta) / sqrt_alpha_t
 
-                # Reconstruction loss over masked regions
-                rec_loss = criterion_l1(x0_pred * masks_expanded_C, real_images * masks_expanded_C)
+                # Reconstruction loss over the whole image
+                rec_loss = criterion_l1(x0_pred, real_images)
 
-                # Perceptual loss over masked regions
-                def compute_perceptual_loss(x, y, mask):
+                # Perceptual loss over the whole image
+                def compute_perceptual_loss(x, y):
                     loss = 0.0
                     layers = [3, 8, 15]  # Fewer layers for faster computation
                     x_features = x
@@ -439,32 +420,21 @@ def main(rank, world_size):
                         x_features = layer(x_features)
                         y_features = layer(y_features)
                         if i in layers:
-                            # Resize mask to match feature map size
-                            current_mask = F.interpolate(mask, size=x_features.shape[2:], mode='nearest')  # [B, 1, H', W']
-                            # Focus on masked regions
-                            masked_x = x_features * (1 - current_mask)
-                            masked_y = y_features * (1 - current_mask)
-                            loss += criterion_l1(masked_x, masked_y) / len(layers)
+                            loss += criterion_l1(x_features, y_features) / len(layers)
                         if i >= max(layers):
                             break
                     return loss
 
-                perc_loss = compute_perceptual_loss(x0_pred, real_images, masks)
+                perc_loss = compute_perceptual_loss(x0_pred, real_images)
 
-                # Style loss over masked regions
-                def compute_gram_matrix(feat, mask):
+                # Style loss over the whole image
+                def compute_gram_matrix(feat):
                     B, C, H, W = feat.size()
-                    # Resize mask to match feature map size
-                    current_mask = F.interpolate(mask, size=(H, W), mode='nearest')  # [B, 1, H, W]
-                    # Focus on masked regions
-                    masked_feat = feat * (1 - current_mask)
-                    # Flatten spatial dimensions
-                    masked_feat_flat = masked_feat.view(B, C, -1)  # [B, C, H*W]
-                    # Compute gram matrix
-                    gram = torch.bmm(masked_feat_flat, masked_feat_flat.transpose(1, 2)) / (C * H * W)
+                    feat_flat = feat.view(B, C, -1)  # [B, C, H*W]
+                    gram = torch.bmm(feat_flat, feat_flat.transpose(1, 2)) / (C * H * W)
                     return gram
 
-                def compute_style_loss(x, y, mask):
+                def compute_style_loss(x, y):
                     loss = 0.0
                     layers = [3, 8, 15]
                     x_features = x
@@ -473,22 +443,20 @@ def main(rank, world_size):
                         x_features = layer(x_features)
                         y_features = layer(y_features)
                         if i in layers:
-                            x_gram = compute_gram_matrix(x_features, mask)
-                            y_gram = compute_gram_matrix(y_features, mask)
+                            x_gram = compute_gram_matrix(x_features)
+                            y_gram = compute_gram_matrix(y_features)
                             loss += criterion_l1(x_gram, y_gram) / len(layers)
                         if i >= max(layers):
                             break
                     return loss
 
-                style_loss = compute_style_loss(x0_pred, real_images, masks)
+                style_loss = compute_style_loss(x0_pred, real_images)
 
-                # Total variation loss over the reconstructed image (masked regions)
+                # Total variation loss over the reconstructed image
                 dx = x0_pred[:, :, :, 1:] - x0_pred[:, :, :, :-1]
                 dy = x0_pred[:, :, 1:, :] - x0_pred[:, :, :-1, :]
-                mask_dx = (1 - masks[:, :, :, 1:]) * (1 - masks[:, :, :, :-1])
-                mask_dy = (1 - masks[:, :, 1:, :]) * (1 - masks[:, :, :-1, :])
 
-                tv_loss = (torch.mean(torch.abs(dx * mask_dx)) + torch.mean(torch.abs(dy * mask_dy))) / 2
+                tv_loss = (torch.mean(torch.abs(dx)) + torch.mean(torch.abs(dy))) / 2
 
                 # Total loss
                 total_loss = lambda_noise * noise_loss + \
@@ -504,8 +472,8 @@ def main(rank, world_size):
 
                 # Compute metrics
                 with torch.no_grad():
-                    mse_batch = compute_mse_masked(x0_pred, real_images, masks)
-                    psnr_batch = compute_psnr_masked(x0_pred, real_images, masks)
+                    mse_batch = compute_mse(x0_pred, real_images)
+                    psnr_batch = compute_psnr(x0_pred, real_images)
                     ssim_batch = compute_ssim(x0_pred, real_images)
 
                 # Update progress bar only on rank 0
@@ -548,13 +516,12 @@ def main(rank, world_size):
                     # Compute previous image
                     generated_images = scheduler.step(noise_pred, t, generated_images).prev_sample
 
-                    # Enforce known pixels
-                    generated_images = generated_images * (1 - masks_sample) + real_images_sample * masks_sample
+                    # Do not enforce known pixels; allow the model to generate the entire image
 
                 # Compute evaluation metrics
                 with torch.no_grad():
-                    mse_epoch = compute_mse_masked(generated_images, real_images_sample, masks_sample)
-                    psnr_epoch = compute_psnr_masked(generated_images, real_images_sample, masks_sample)
+                    mse_epoch = compute_mse(generated_images, real_images_sample)
+                    psnr_epoch = compute_psnr(generated_images, real_images_sample)
                     ssim_epoch = compute_ssim(generated_images, real_images_sample)
 
                 # Logging
