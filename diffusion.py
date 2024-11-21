@@ -291,26 +291,35 @@ def main(rank, world_size):
                                          [1, 2, 1]]]], dtype=torch.float32).to(device)
 
         # Initialize models and wrap with DDP
-        # Adjusted input channels to 7 (3 for image + 1 for mask + 1 for S_norm + 1 for edge map + 1 for attention map)
-        # Simplified model architecture for faster training
+        # Adjusted model capacity by reducing the number of layers
         model = UNet2DModel(
             sample_size=32,  # CIFAR-10 images are 32x32
             in_channels=7,   # Number of input channels
             out_channels=3,  # RGB channels
-            layers_per_block=1,  # Reduced from 2 to 1
-            block_out_channels=(64, 128, 256),  # Reduced number of channels
-            down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D"),
-            up_block_types=("AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),
+            layers_per_block=2,  # Adjusted layers per block
+            block_out_channels=(128, 256, 256, 512),  # Adjusted number of channels
+            down_block_types=(
+                "DownBlock2D",        # 32x32 -> 16x16
+                "AttnDownBlock2D",    # 16x16 -> 8x8
+                "DownBlock2D",        # 8x8 -> 4x4
+                "DownBlock2D",        # 4x4 -> 2x2
+            ),
+            up_block_types=(
+                "UpBlock2D",          # 2x2 -> 4x4
+                "UpBlock2D",          # 4x4 -> 8x8
+                "AttnUpBlock2D",      # 8x8 -> 16x16
+                "UpBlock2D",          # 16x16 -> 32x32
+            ),
         ).to(device)
 
         # Convert BatchNorm layers to SyncBatchNorm if any
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
         # Wrap model with DDP
-        model = DDP(model, device_ids=[rank])
+        model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
         # Define the scheduler (the diffusion process)
-        scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule="linear")
+        scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule="linear", prediction_type="epsilon")
 
         # Ensure alphas_cumprod are on the correct device and type
         scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device).float()
@@ -318,8 +327,8 @@ def main(rank, world_size):
         # Set number of inference steps
         num_inference_steps = 50  # You can adjust this value as needed
 
-        # Reduce learning rate to slow down learning
-        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+        # Adjusted learning rate for better convergence
+        optimizer = optim.AdamW(model.parameters(), lr=2e-4)
 
         # Load VGG19 for perceptual and style losses
         vgg_model = torchvision.models.vgg19(pretrained=True).features.to(device).eval()
@@ -339,13 +348,14 @@ def main(rank, world_size):
             os.makedirs('./plots', exist_ok=True)
 
         # Training loop
-        num_epochs = 400  # Increased the number of epochs
+        num_epochs = 300  # Training for 300 epochs
 
+        # Loss weights adjusted for better balance
         lambda_noise = 1.0
-        lambda_rec = 5.0
-        lambda_perc = 0.5
-        lambda_style = 1.0  # Reduced from 100 to 1
-        lambda_tv = 0.05
+        lambda_rec = 1.0
+        lambda_perc = 0.1
+        lambda_style = 250.0
+        lambda_tv = 0.1
 
         for epoch in range(num_epochs):
             train_sampler.set_epoch(epoch)
@@ -397,7 +407,7 @@ def main(rank, world_size):
                 # Compute attention map from S_norm
                 attention_map = torch.sigmoid(attention_conv(S_norm))
 
-                # Create noisy complete images
+                # Create noisy incomplete images
                 noise = torch.randn_like(real_images)
                 timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
 
@@ -405,10 +415,10 @@ def main(rank, world_size):
                 sqrt_alpha_t = torch.sqrt(alpha_t)
                 sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
 
-                noisy_real_images = sqrt_alpha_t * real_images + sqrt_one_minus_alpha_t * noise
+                noisy_incomplete_images = sqrt_alpha_t * incomplete_images + sqrt_one_minus_alpha_t * noise
 
-                # Prepare model inputs with full noisy images
-                model_inputs = torch.cat([noisy_real_images, masks, S_norm, edge_maps, attention_map], dim=1)  # [B, 7, H, W]
+                # Prepare model inputs with incomplete images
+                model_inputs = torch.cat([noisy_incomplete_images, masks, S_norm, edge_maps, attention_map], dim=1)  # [B, 7, H, W]
 
                 # Forward pass
                 optimizer.zero_grad()
@@ -423,7 +433,7 @@ def main(rank, world_size):
                 noise_loss = criterion_mse(epsilon_theta * masks_expanded_C, noise * masks_expanded_C)
 
                 # Reconstructed image estimate
-                x0_pred = (noisy_real_images - sqrt_one_minus_alpha_t * epsilon_theta) / sqrt_alpha_t
+                x0_pred = (noisy_incomplete_images - sqrt_one_minus_alpha_t * epsilon_theta) / sqrt_alpha_t
 
                 # Reconstruction loss over masked regions
                 rec_loss = criterion_l1(x0_pred * masks_expanded_C, real_images * masks_expanded_C)
@@ -443,7 +453,7 @@ def main(rank, world_size):
                             # Focus on masked regions
                             masked_x = x_features * (1 - current_mask)
                             masked_y = y_features * (1 - current_mask)
-                            loss += criterion_l1(masked_x, masked_y)
+                            loss += criterion_l1(masked_x, masked_y) / len(layers)
                         if i >= max(layers):
                             break
                     return loss
@@ -474,7 +484,7 @@ def main(rank, world_size):
                         if i in layers:
                             x_gram = compute_gram_matrix(x_features, mask)
                             y_gram = compute_gram_matrix(y_features, mask)
-                            loss += criterion_l1(x_gram, y_gram)
+                            loss += criterion_l1(x_gram, y_gram) / len(layers)
                         if i >= max(layers):
                             break
                     return loss
@@ -487,7 +497,7 @@ def main(rank, world_size):
                 mask_dx = (1 - masks[:, :, :, 1:]) * (1 - masks[:, :, :, :-1])
                 mask_dy = (1 - masks[:, :, 1:, :]) * (1 - masks[:, :, :-1, :])
 
-                tv_loss = torch.mean(torch.abs(dx * mask_dx)) + torch.mean(torch.abs(dy * mask_dy))
+                tv_loss = (torch.mean(torch.abs(dx * mask_dx)) + torch.mean(torch.abs(dy * mask_dy))) / 2
 
                 # Total loss
                 total_loss = lambda_noise * noise_loss + \
@@ -502,9 +512,10 @@ def main(rank, world_size):
                 optimizer.step()
 
                 # Compute metrics
-                mse_batch = compute_mse_masked(x0_pred, real_images, masks)
-                psnr_batch = compute_psnr_masked(x0_pred, real_images, masks)
-                ssim_batch = compute_ssim(x0_pred, real_images)
+                with torch.no_grad():
+                    mse_batch = compute_mse_masked(x0_pred, real_images, masks)
+                    psnr_batch = compute_psnr_masked(x0_pred, real_images, masks)
+                    ssim_batch = compute_ssim(x0_pred, real_images)
 
                 # Update progress bar only on rank 0
                 if rank == 0:
@@ -533,11 +544,7 @@ def main(rank, world_size):
                 # Start reverse diffusion process
                 scheduler.set_timesteps(num_inference_steps)
 
-                # Retrieve alphas and betas for the timesteps
-                alphas = scheduler.alphas_cumprod.to(device)
-                sqrt_alphas = torch.sqrt(alphas)
-                sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
-
+                # Reverse diffusion loop
                 for t in scheduler.timesteps:
                     timesteps_sample = torch.tensor([t] * n_images, device=device).long()
 
@@ -567,8 +574,8 @@ def main(rank, world_size):
                 # Optional: print the metrics
                 print(f"Epoch [{epoch+1}/{num_epochs}], MSE: {mse_epoch:.6f}, PSNR: {psnr_epoch:.4f}, SSIM: {ssim_epoch:.4f}")
 
-                # Save images every 10 epochs
-                if (epoch + 1) % 10 == 0:
+                # Save images every 5 epochs
+                if (epoch + 1) % 5 == 0:
                     # Save generated images
                     for i in range(n_images):
                         fig, axs = plt.subplots(1, 3, figsize=(12, 4))
@@ -598,7 +605,7 @@ def main(rank, world_size):
                         plt.savefig(f'./plots/epoch_{epoch+1}_image_{i+1}.png')
                         plt.close()
 
-                    # Save the model every 10 epochs
+                    # Save the model every 5 epochs
                     model_dir = 'models'
                     os.makedirs(model_dir, exist_ok=True)
                     model_path = os.path.join(model_dir, f'model_epoch_{epoch+1}.pth')
