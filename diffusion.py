@@ -33,17 +33,17 @@ def generate_random_mask(H, W, target_percent=0.2):
 
     # Keep adding strokes until the target percent of the image is masked
     while True:
-        num_strokes = random.randint(1, 4)
+        num_strokes = random.randint(1, 6)
         for _ in range(num_strokes):
             # Random starting point
             start_x = random.randint(0, W)
             start_y = random.randint(0, H)
 
             # Random brush properties
-            brush_width = random.randint(3, 7)  # Adjusted for smaller images
-            num_vertices = random.randint(2, 5)
+            brush_width = random.randint(5, 15)  # Adjusted for larger images
+            num_vertices = random.randint(4, 8)
             angles = np.random.uniform(0, 2 * np.pi, size=(num_vertices,))
-            lengths = np.random.uniform(5, 15, size=(num_vertices,))  # Adjusted for smaller images
+            lengths = np.random.uniform(10, 40, size=(num_vertices,))  # Adjusted for larger images
 
             # Generate stroke points
             points = [(start_x, start_y)]
@@ -244,18 +244,20 @@ def main(rank, world_size):
         # Load CIFAR-10 Dataset
         print(f"Rank {rank} loading CIFAR-10 dataset.")
 
-        # Define transform
+        # Adjusted transform for higher resolution images
         transform = transforms.Compose([
-            transforms.Resize(32),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)  # Normalize to [-1, 1]
+            transforms.Resize(64),  # Increased image size
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(64, padding=4),
+            transforms.ToTensor(),  # Converts images to (C, H, W)
+            transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         ])
 
         train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
 
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
-        train_loader = DataLoader(train_dataset, batch_size=128, sampler=train_sampler, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=64, sampler=train_sampler, num_workers=4, pin_memory=True)
 
         # Define Sobel kernels once
         sobel_kernel_x = torch.tensor([[[[-1, 0, 1],
@@ -267,12 +269,13 @@ def main(rank, world_size):
 
         # Initialize models and wrap with DDP
         model = UNet2DModel(
-            sample_size=32,  # CIFAR-10 images are 32x32
+            sample_size=64,  # Adjusted for 64x64 images
             in_channels=7,   # Number of input channels
             out_channels=3,  # RGB channels
-            layers_per_block=3,  # Increased layers per block for better learning
-            block_out_channels=(64, 128, 256, 512),  # Adjusted model capacity
+            layers_per_block=2,  # Reduced layers per block to manage computational load
+            block_out_channels=(128, 256, 256, 512, 512),  # Increased model capacity
             down_block_types=(
+                "DownBlock2D",        # 64x64 -> 32x32
                 "DownBlock2D",        # 32x32 -> 16x16
                 "DownBlock2D",        # 16x16 -> 8x8
                 "DownBlock2D",        # 8x8 -> 4x4
@@ -283,6 +286,7 @@ def main(rank, world_size):
                 "UpBlock2D",          # 4x4 -> 8x8
                 "UpBlock2D",          # 8x8 -> 16x16
                 "UpBlock2D",          # 16x16 -> 32x32
+                "UpBlock2D",          # 32x32 -> 64x64
             ),
         ).to(device)
 
@@ -290,22 +294,25 @@ def main(rank, world_size):
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
         # Wrap model with DDP
-        model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+        model = DDP(model, device_ids=[rank], output_device=rank)
 
-        # Define the scheduler (the diffusion process)
-        scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule="linear", prediction_type="epsilon")
+        # Define the scheduler (the diffusion process) with supported beta schedule
+        scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule="scaled_linear", prediction_type="epsilon")
 
         # Ensure alphas_cumprod are on the correct device and type
         scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device).float()
 
         # Set number of inference steps
-        num_inference_steps = 50  # Reduced the number of inference steps for faster inference
+        num_inference_steps = 200  # Increased the number of inference steps for better image quality
 
-        # Adjusted learning rate for faster learning
-        optimizer = optim.AdamW(model.parameters(), lr=2e-4)
+        # Adjusted learning rate for better convergence
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 
-        # Load VGG19 for perceptual and style losses
-        vgg_model = torchvision.models.vgg19(pretrained=True).features.to(device).eval()
+        # Learning rate scheduler
+        scheduler_lr = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+
+        # Load VGG16 for perceptual loss (lighter than VGG19)
+        vgg_model = torchvision.models.vgg16(pretrained=True).features.to(device).eval()
         for param in vgg_model.parameters():
             param.requires_grad = False
 
@@ -322,13 +329,12 @@ def main(rank, world_size):
             os.makedirs('./plots', exist_ok=True)
 
         # Training loop
-        num_epochs = 150  # Reduced number of epochs for faster training
+        num_epochs = 250  # Set number of epochs to 250 as per your request
 
         # Loss weights adjusted for better balance
         lambda_noise = 1.0
-        lambda_rec = 1.0
-        lambda_perc = 0.1
-        lambda_style = 1.0
+        lambda_rec = 10.0  # Increased reconstruction loss weight
+        lambda_perc = 1.0  # Increased perceptual loss weight
         lambda_tv = 0.1
 
         for epoch in range(num_epochs):
@@ -340,7 +346,7 @@ def main(rank, world_size):
 
             for data in pbar:
                 real_images, _ = data
-                real_images = real_images.to(device, non_blocking=True)
+                real_images = real_images.to(device, non_blocking=True)  # Shape: [B, 3, H, W]
                 batch_size, C, H, W = real_images.size()
 
                 # Generate masks
@@ -407,11 +413,11 @@ def main(rank, world_size):
                 # Reconstructed image estimate
                 x0_pred = (noisy_incomplete_images - sqrt_one_minus_alpha_t * epsilon_theta) / sqrt_alpha_t
 
-                # Reconstruction loss over the whole image
-                rec_loss = criterion_l1(x0_pred, real_images)
+                # Reconstruction loss over the masked regions only
+                rec_loss = criterion_l1(x0_pred * (1 - masks), real_images * (1 - masks))
 
-                # Perceptual loss over the whole image
-                def compute_perceptual_loss(x, y):
+                # Perceptual loss over the masked regions only
+                def compute_perceptual_loss(x, y, masks):
                     loss = 0.0
                     layers = [3, 8, 15]  # Fewer layers for faster computation
                     x_features = x
@@ -420,37 +426,16 @@ def main(rank, world_size):
                         x_features = layer(x_features)
                         y_features = layer(y_features)
                         if i in layers:
-                            loss += criterion_l1(x_features, y_features) / len(layers)
+                            # Resize masks to match feature map size
+                            mask_resized = F.interpolate(masks, size=x_features.shape[2:], mode='bilinear', align_corners=False)
+                            # Expand mask to match number of channels
+                            mask_expanded = mask_resized.expand(-1, x_features.shape[1], -1, -1)
+                            loss += criterion_l1(x_features * (1 - mask_expanded), y_features * (1 - mask_expanded)) / len(layers)
                         if i >= max(layers):
                             break
                     return loss
 
-                perc_loss = compute_perceptual_loss(x0_pred, real_images)
-
-                # Style loss over the whole image
-                def compute_gram_matrix(feat):
-                    B, C, H, W = feat.size()
-                    feat_flat = feat.view(B, C, -1)  # [B, C, H*W]
-                    gram = torch.bmm(feat_flat, feat_flat.transpose(1, 2)) / (C * H * W)
-                    return gram
-
-                def compute_style_loss(x, y):
-                    loss = 0.0
-                    layers = [3, 8, 15]
-                    x_features = x
-                    y_features = y
-                    for i, layer in enumerate(vgg_model):
-                        x_features = layer(x_features)
-                        y_features = layer(y_features)
-                        if i in layers:
-                            x_gram = compute_gram_matrix(x_features)
-                            y_gram = compute_gram_matrix(y_features)
-                            loss += criterion_l1(x_gram, y_gram) / len(layers)
-                        if i >= max(layers):
-                            break
-                    return loss
-
-                style_loss = compute_style_loss(x0_pred, real_images)
+                perc_loss = compute_perceptual_loss(x0_pred, real_images, masks)
 
                 # Total variation loss over the reconstructed image
                 dx = x0_pred[:, :, :, 1:] - x0_pred[:, :, :, :-1]
@@ -462,7 +447,6 @@ def main(rank, world_size):
                 total_loss = lambda_noise * noise_loss + \
                              lambda_rec * rec_loss + \
                              lambda_perc * perc_loss + \
-                             lambda_style * style_loss + \
                              lambda_tv * tv_loss
 
                 total_loss.backward()
@@ -472,17 +456,22 @@ def main(rank, world_size):
 
                 # Compute metrics
                 with torch.no_grad():
-                    mse_batch = compute_mse(x0_pred, real_images)
-                    psnr_batch = compute_psnr(x0_pred, real_images)
-                    ssim_batch = compute_ssim(x0_pred, real_images)
+                    mse_batch = compute_mse(x0_pred * (1 - masks), real_images * (1 - masks))
+                    psnr_batch = compute_psnr(x0_pred * (1 - masks), real_images * (1 - masks))
+                    ssim_batch = compute_ssim(x0_pred * (1 - masks), real_images * (1 - masks))
 
                 # Update progress bar only on rank 0
                 if rank == 0:
+                    current_lr = optimizer.param_groups[0]['lr']
                     pbar.set_postfix({
                         'Total Loss': f'{total_loss.item():.4f}',
                         'PSNR': f'{psnr_batch:.2f}',
                         'SSIM': f'{ssim_batch:.4f}',
+                        'LR': f'{current_lr:.6f}',
                     })
+
+            # Step the learning rate scheduler
+            scheduler_lr.step()
 
             # At the end of each epoch, only rank 0 outputs statistics, saves plots, and saves the model
             if rank == 0 and (epoch + 1) % 5 == 0:
@@ -516,13 +505,14 @@ def main(rank, world_size):
                     # Compute previous image
                     generated_images = scheduler.step(noise_pred, t, generated_images).prev_sample
 
-                    # Do not enforce known pixels; allow the model to generate the entire image
+                    # Enforce known pixels
+                    generated_images = generated_images * (1 - masks_sample) + incomplete_images_sample
 
                 # Compute evaluation metrics
                 with torch.no_grad():
-                    mse_epoch = compute_mse(generated_images, real_images_sample)
-                    psnr_epoch = compute_psnr(generated_images, real_images_sample)
-                    ssim_epoch = compute_ssim(generated_images, real_images_sample)
+                    mse_epoch = compute_mse(generated_images * (1 - masks_sample), real_images_sample * (1 - masks_sample))
+                    psnr_epoch = compute_psnr(generated_images * (1 - masks_sample), real_images_sample * (1 - masks_sample))
+                    ssim_epoch = compute_ssim(generated_images * (1 - masks_sample), real_images_sample * (1 - masks_sample))
 
                 # Logging
                 with open('log.txt', 'a') as f:
