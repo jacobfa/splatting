@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
-from torchvision import datasets, transforms
+from torchvision import transforms
 from torch.utils.data import DataLoader, DistributedSampler
 import numpy as np
 import random
@@ -15,6 +15,7 @@ from diffusers import DDPMScheduler, UNet2DModel
 import scipy.ndimage
 import os
 from tqdm import tqdm
+from datasets import load_dataset  # Import Hugging Face's datasets
 
 # ============================
 # Helper Functions
@@ -219,6 +220,23 @@ def compute_ssim(img1, img2):
     return ssim.item()
 
 # ============================
+# CelebADataset Class (Moved Outside main)
+# ============================
+
+class CelebADataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, transform=None):
+        self.dataset = dataset
+        self.transform = transform
+    def __len__(self):
+        return len(self.dataset)
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        image = item['image']
+        if self.transform:
+            image = self.transform(image)
+        return image, 0  # Return image and dummy label
+
+# ============================
 # Main Training Function
 # ============================
 
@@ -241,19 +259,21 @@ def main(rank, world_size):
         device = torch.device('cuda', rank)
         print(f"Rank {rank} set to device {device}.")
 
-        # Load CIFAR-10 Dataset
-        print(f"Rank {rank} loading CIFAR-10 dataset.")
+        # Load CelebA Dataset via Hugging Face
+        print(f"Rank {rank} loading CelebA dataset via Hugging Face.")
+
+        from datasets import load_dataset
+        dataset = load_dataset("nielsr/CelebA-faces", split='train')
 
         # Adjusted transform for higher resolution images
         transform = transforms.Compose([
-            transforms.Resize(64),  # Increased image size
+            transforms.Resize((64, 64)),  # Resize to 64x64
             transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(64, padding=4),
             transforms.ToTensor(),  # Converts images to (C, H, W)
             transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
         ])
 
-        train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+        train_dataset = CelebADataset(dataset, transform=transform)
 
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
@@ -336,6 +356,7 @@ def main(rank, world_size):
         lambda_rec = 10.0  # Increased reconstruction loss weight
         lambda_perc = 1.0  # Increased perceptual loss weight
         lambda_tv = 0.1
+        lambda_known = 10.0  # New loss weight for known region consistency
 
         for epoch in range(num_epochs):
             train_sampler.set_epoch(epoch)
@@ -350,11 +371,11 @@ def main(rank, world_size):
                 batch_size, C, H, W = real_images.size()
 
                 # Generate masks
-                masks = []
+                masks_list = []
                 for _ in range(batch_size):
                     mask = generate_random_mask(H, W)
-                    masks.append(mask)
-                masks = np.stack(masks, axis=0)
+                    masks_list.append(mask)
+                masks = np.stack(masks_list, axis=0)
                 masks = torch.from_numpy(masks).unsqueeze(1).float().to(device, non_blocking=True)  # [B, 1, H, W]
 
                 # Incomplete images (masked images)
@@ -387,7 +408,7 @@ def main(rank, world_size):
                 # Compute attention map from S_norm
                 attention_map = torch.sigmoid(attention_conv(S_norm))
 
-                # Create noisy incomplete images
+                # Create noisy incomplete images (noise added only to masked regions)
                 noise = torch.randn_like(real_images)
                 timesteps = torch.randint(0, scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
 
@@ -395,7 +416,12 @@ def main(rank, world_size):
                 sqrt_alpha_t = torch.sqrt(alpha_t)
                 sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
 
-                noisy_incomplete_images = sqrt_alpha_t * incomplete_images + sqrt_one_minus_alpha_t * noise
+                sqrt_alpha_t = sqrt_alpha_t.view(-1, 1, 1, 1)
+                sqrt_one_minus_alpha_t = sqrt_one_minus_alpha_t.view(-1, 1, 1, 1)
+                noisy_images = sqrt_alpha_t * real_images + sqrt_one_minus_alpha_t * noise
+
+                # Apply masks to keep known regions intact
+                noisy_incomplete_images = real_images * masks + noisy_images * (1 - masks)
 
                 # Prepare model inputs with incomplete images
                 model_inputs = torch.cat([noisy_incomplete_images, masks, S_norm, edge_maps, attention_map], dim=1)  # [B, 7, H, W]
@@ -404,17 +430,20 @@ def main(rank, world_size):
                 optimizer.zero_grad()
                 model_output = model(model_inputs, timesteps).sample  # [B, 3, H, W]
 
-                # Compute the predicted noise residual over the whole image
+                # Compute the predicted noise residual over the masked regions only
                 epsilon_theta = model_output
 
-                # Noise prediction loss computed over the whole image
-                noise_loss = criterion_mse(epsilon_theta, noise)
+                # Noise prediction loss computed over the masked regions only
+                noise_loss = criterion_mse(epsilon_theta * (1 - masks), noise * (1 - masks))
 
                 # Reconstructed image estimate
                 x0_pred = (noisy_incomplete_images - sqrt_one_minus_alpha_t * epsilon_theta) / sqrt_alpha_t
 
                 # Reconstruction loss over the masked regions only
                 rec_loss = criterion_l1(x0_pred * (1 - masks), real_images * (1 - masks))
+
+                # Known region consistency loss
+                known_region_loss = criterion_l1(x0_pred * masks, real_images * masks)
 
                 # Perceptual loss over the masked regions only
                 def compute_perceptual_loss(x, y, masks):
@@ -427,7 +456,7 @@ def main(rank, world_size):
                         y_features = layer(y_features)
                         if i in layers:
                             # Resize masks to match feature map size
-                            mask_resized = F.interpolate(masks, size=x_features.shape[2:], mode='bilinear', align_corners=False)
+                            mask_resized = F.interpolate(masks, size=x_features.shape[2:], mode='nearest')
                             # Expand mask to match number of channels
                             mask_expanded = mask_resized.expand(-1, x_features.shape[1], -1, -1)
                             loss += criterion_l1(x_features * (1 - mask_expanded), y_features * (1 - mask_expanded)) / len(layers)
@@ -447,7 +476,8 @@ def main(rank, world_size):
                 total_loss = lambda_noise * noise_loss + \
                              lambda_rec * rec_loss + \
                              lambda_perc * perc_loss + \
-                             lambda_tv * tv_loss
+                             lambda_tv * tv_loss + \
+                             lambda_known * known_region_loss
 
                 total_loss.backward()
                 # Apply gradient clipping
@@ -506,7 +536,7 @@ def main(rank, world_size):
                     generated_images = scheduler.step(noise_pred, t, generated_images).prev_sample
 
                     # Enforce known pixels
-                    generated_images = generated_images * (1 - masks_sample) + incomplete_images_sample
+                    generated_images = generated_images * (1 - masks_sample) + real_images_sample * masks_sample
 
                 # Compute evaluation metrics
                 with torch.no_grad():
