@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms, utils
+from torchvision import transforms, datasets
 
 # For progress bar
 from tqdm import tqdm
@@ -21,17 +21,20 @@ matplotlib.use('Agg')  # non-interactive backend (useful on servers)
 import matplotlib.pyplot as plt
 
 
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 1) Random hole mask helper
-# -------------------------------------------------------------------------
-def random_mask(img, hole_size=8):
+# -----------------------------------------------------------------------------
+def random_mask(img, hole_size=64):
     """
     Given a tensor image of shape (3, H, W),
     create a random square hole and return (partial_img, mask).
-    mask: (1, H, W) with 1s for known, 0s for the hole.
+    mask: (1, H, W) with 1s for known pixels, 0s for the hole.
     partial_img = original * mask
     """
     _, h, w = img.shape
+    if hole_size >= h or hole_size >= w:
+        raise ValueError(f"Hole size ({hole_size}) is too large for image {h}x{w}.")
+
     top = torch.randint(0, h - hole_size, (1,)).item()
     left = torch.randint(0, w - hole_size, (1,)).item()
     
@@ -44,344 +47,425 @@ def random_mask(img, hole_size=8):
     return partial_img, mask
 
 
-# -------------------------------------------------------------------------
-# 2) CIFAR-10 inpainting dataset
-# -------------------------------------------------------------------------
-class CIFAR10InpaintingDataset(Dataset):
-    def __init__(self, root='data', train=True, transform=None, hole_size=8):
+# -----------------------------------------------------------------------------
+# 2) Example inpainting dataset (using torchvision's Places365 for demonstration)
+# -----------------------------------------------------------------------------
+class Places365InpaintingDataset(Dataset):
+    """
+    Wraps torchvision.datasets.Places365 to apply random hole masks.
+    By default, uses 'train-standard' if train=True, else 'val'.
+    """
+    def __init__(self, root='.', train=True, transform=None, hole_size=64, small=False):
         super().__init__()
-        self.dataset = datasets.CIFAR10(
+        self.hole_size = hole_size
+        self.train = train
+        split = 'train-standard' if train else 'val'
+
+        self.dataset = datasets.Places365(
             root=root,
-            train=train,
-            download=True,
+            split=split,
+            small=small,       # If True, images are ~256 on shorter side
+            download=True,     # Will attempt to download metadata/devkit
             transform=transform
         )
-        self.hole_size = hole_size
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        img, _ = self.dataset[idx]  # shape: (3, 32, 32)
+        img, _ = self.dataset[idx]  # shape: (3, H, W) after transform
         partial_img, mask = random_mask(img, self.hole_size)
-        # ground truth is the original
-        gt_img = img
+        gt_img = img  # ground truth is the original
         return partial_img, mask, gt_img
 
 
-# -------------------------------------------------------------------------
-# 3) A simple Transformer-based generator
-#    We'll do patchify => transformer => unpatchify
-# -------------------------------------------------------------------------
-class PatchEmbed(nn.Module):
+# -----------------------------------------------------------------------------
+# 3) A UNet backbone for diffusion (3 downs, 1 bottleneck, 3 ups => final 256x256)
+# -----------------------------------------------------------------------------
+class DoubleConv(nn.Module):
     """
-    Splits an image into patches, then projects each patch to an embed dimension.
-    For a 32x32 image with patch_size=4 => 8x8=64 patches total.
+    (Conv => ReLU => Conv => ReLU)
     """
-    def __init__(self, in_chans=4, embed_dim=192, patch_size=4, img_size=32):
-        super().__init__()
-        self.patch_size = patch_size
-        self.img_size = img_size
-        self.embed_dim = embed_dim
-        
-        # Project each patch (in_chans * patch_size * patch_size) -> embed_dim
-        self.proj = nn.Conv2d(
-            in_chans,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size
-        )
-
-        # Number of patches
-        self.num_patches = (img_size // patch_size) * (img_size // patch_size)
-
-    def forward(self, x):
-        # x: (B, in_chans, 32, 32)
-        x = self.proj(x)  # => (B, embed_dim, 8, 8) for patch_size=4
-        B, C, H, W = x.shape
-        x = x.flatten(2)   # (B, C, H*W) => (B, 192, 64)
-        x = x.transpose(1, 2)  # => (B, 64, 192)
-        return x
-
-
-class PatchUnembed(nn.Module):
-    """
-    Reverse of PatchEmbed: take (B, num_patches, embed_dim) and reshape
-    back to (B, out_chans, img_size, img_size).
-    """
-    def __init__(self, out_chans=3, embed_dim=192, patch_size=4, img_size=32):
-        super().__init__()
-        self.patch_size = patch_size
-        self.img_size = img_size
-        self.embed_dim = embed_dim
-        
-        self.conv = nn.ConvTranspose2d(
-            embed_dim,
-            out_chans,
-            kernel_size=patch_size,
-            stride=patch_size
-        )
-
-    def forward(self, x, B):
-        # x: (B, num_patches, embed_dim)
-        num_patches_per_row = self.img_size // self.patch_size
-
-        x = x.transpose(1, 2)  # => (B, embed_dim, num_patches)
-        x = x.view(B, self.embed_dim, num_patches_per_row, num_patches_per_row)
-        x = self.conv(x)  # => (B, out_chans, 32, 32)
-        return x
-
-
-class SimpleTransformerGenerator(nn.Module):
-    """
-    Input: (partial_img + mask) => patchify => Transformer => unpatchify => (full image).
-    """
-    def __init__(self, in_chans=4, out_chans=3, 
-                 img_size=32, patch_size=4, 
-                 embed_dim=192, depth=4, num_heads=6):
-        super().__init__()
-        self.patch_embed = PatchEmbed(in_chans, embed_dim, patch_size, img_size)
-        
-        # Positional embeddings for each patch
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.patch_embed.num_patches, embed_dim)
-        )
-
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim*4,
-            activation='gelu',
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=depth
-        )
-
-        # Unpatchify
-        self.unpatch = PatchUnembed(out_chans, embed_dim, patch_size, img_size)
-
-    def forward(self, x):
-        # x shape: (B, 4, 32, 32)
-        B = x.shape[0]
-        x = self.patch_embed(x)          # => (B, num_patches, embed_dim)
-        x = x + self.pos_embed           # Add positional embedding
-        x = self.transformer(x)          # => (B, num_patches, embed_dim)
-        out = self.unpatch(x, B)         # => (B, out_chans, 32, 32)
-        return out
-
-
-# -------------------------------------------------------------------------
-# 4) Discriminator (simple CNN)
-# -------------------------------------------------------------------------
-class SimpleDiscriminator(nn.Module):
-    """
-    Patch-based CNN for real/fake classification.
-    """
-    def __init__(self, in_channels=3, base_channels=64):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base_channels, base_channels*2, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(base_channels*2, 1, 4, 1, 1)
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
-        # x: (B, 3, 32, 32)
         return self.net(x)
 
 
-# -------------------------------------------------------------------------
-# 5) Utility losses
-# -------------------------------------------------------------------------
-def adversarial_loss(pred, is_real=True):
+class Down(nn.Module):
     """
-    Minimizes BCE loss for real/fake classification.
+    Downscale by stride-2 conv
     """
-    target = torch.ones_like(pred) if is_real else torch.zeros_like(pred)
-    return F.binary_cross_entropy_with_logits(pred, target)
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 4, 2, 1),  # stride=2
+            nn.ReLU(inplace=True),
+        )
 
-def reconstruction_loss(pred, target, mask):
-    """
-    L1 loss in the known (mask=1) region only.
-    """
-    return F.l1_loss(pred * mask, target * mask)
+    def forward(self, x):
+        return self.net(x)
 
 
-# -------------------------------------------------------------------------
-# 6) Training function (uses tqdm + gradient clipping)
-# -------------------------------------------------------------------------
-def train_one_epoch(gen, disc, dataloader, optG, optD, device,
-                    lambda_rec=1.0, lambda_adv=0.01, max_grad_norm=1.0):
+class Up(nn.Module):
     """
-    Runs one epoch of training with TQDM progress bar.
-    Returns average G and D loss.
+    Upscale by transpose conv, then concatenate skip connection, then DoubleConv
     """
-    gen.train()
-    disc.train()
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        # Transpose conv
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1)
+        self.act = nn.ReLU(inplace=True)
+        # After concatenation with the skip, channel count is out_ch + skip_ch => 2*out_ch if skip is out_ch
+        self.conv = DoubleConv(out_ch * 2, out_ch)
 
-    total_g_loss = 0.0
-    total_d_loss = 0.0
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = self.act(x)
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv(x)
+        return x
+
+
+class SimpleUNet(nn.Module):
+    """
+    UNet with 3 downs / 3 ups. For a 256x256 input, the shape changes as:
+       down0: 256 -> 128
+       down1: 128 -> 64
+       down2: 64 -> 32
+    Bottleneck => shape 32x32
+       up2: 32 -> 64
+       up1: 64 -> 128
+       up0: 128 -> 256
+    Output => 256x256
+    """
+    def __init__(self, in_channels=7, base_channels=64):
+        """
+        in_channels=7:
+         - 3 for the current noisy image
+         - 4 for partial_img (3) + mask (1)
+        """
+        super().__init__()
+        # Encoder
+        self.down0 = Down(in_channels, base_channels)         # => (64, 128x128)
+        self.down1 = Down(base_channels, base_channels * 2)   # => (128, 64x64)
+        self.down2 = Down(base_channels * 2, base_channels * 4) # => (256, 32x32)
+
+        # Bottleneck
+        self.mid = DoubleConv(base_channels * 4, base_channels * 4)
+
+        # Decoder
+        self.up2 = Up(base_channels * 4, base_channels * 2)  # skip from down1
+        self.up1 = Up(base_channels * 2, base_channels)      # skip from down0
+
+        # We only have 3 Down blocks, so we do 2 Up blocks so far. We need a final Up:
+        self.up0 = nn.ConvTranspose2d(base_channels, base_channels, kernel_size=4, stride=2, padding=1)
+        self.final_conv = DoubleConv(base_channels, base_channels)
+
+        # Output
+        self.out = nn.Conv2d(base_channels, 3, kernel_size=1)
+
+    def forward(self, x_noisy, x_cond):
+        """
+        x_noisy: (B, 3, H, W)
+        x_cond:  (B, 4, H, W)
+         => cat => (B,7,H,W)
+        We'll produce (B,3,H,W) as the predicted noise.
+        """
+        inp = torch.cat([x_noisy, x_cond], dim=1)  # => (B,7,H,W)
+
+        # Encoder
+        d0 = self.down0(inp)   # => (64, H/2, W/2)
+        d1 = self.down1(d0)    # => (128, H/4, W/4)
+        d2 = self.down2(d1)    # => (256, H/8, W/8)
+
+        # Bottleneck
+        m = self.mid(d2)       # => (256, H/8, W/8)
+
+        # Decoder
+        # 1) up2 from (256->128), skip from d1(128)
+        u2 = self.up2(m, d1)   # => (128, H/4, W/4)
+        # 2) up1 from (128->64), skip from d0(64)
+        u1 = self.up1(u2, d0)  # => (64, H/2, W/2)
+
+        # 3) final up0 from 64->64 channels + spatial x2 => (64, H, W)
+        u0 = self.up0(u1)      # => (64, H, W)
+        u0 = self.final_conv(u0)  # => (64, H, W)
+
+        out = self.out(u0)     # => (3, H, W)
+        return out
+
+
+# -----------------------------------------------------------------------------
+# 4) DDPM-like diffusion utilities
+# -----------------------------------------------------------------------------
+def linear_beta_schedule(timesteps, start=1e-4, end=0.02):
+    """
+    Linear schedule from start to end over 'timesteps'.
+    """
+    return torch.linspace(start, end, timesteps)
+
+
+class DiffusionModel:
+    """
+    Simple DDPM-like diffusion for inpainting.
+    We'll do standard training on entire images but *condition* on partial image + mask.
+    Then for sampling (inference), clamp the known region at each step.
+    """
+    def __init__(self, net: nn.Module, timesteps=1000, device='cuda'):
+        self.net = net
+        self.timesteps = timesteps
+        self.device = device
+
+        # Create beta schedule
+        self.betas = linear_beta_schedule(timesteps, 1e-4, 0.02).to(device)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1,0), value=1.0)
+
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+
+        # For sampling
+        self.posterior_variance = (
+            self.betas
+            * (1.0 - self.alphas_cumprod_prev)
+            / (1.0 - self.alphas_cumprod)
+        )
+
+    def q_sample(self, x0, t, noise=None):
+        """
+        Diffusion forward process:
+          q(x_t | x_0) = N(x_t; sqrt_alphas_cumprod[t]*x_0, (1 - alphas_cumprod[t])I)
+        """
+        if noise is None:
+            noise = torch.randn_like(x0)
+        sqrt_alpha_t = self.sqrt_alphas_cumprod[t].view(-1,1,1,1)
+        sqrt_1m_alpha_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1,1,1,1)
+        return sqrt_alpha_t * x0 + sqrt_1m_alpha_t * noise
+
+    def p_losses(self, x0, t, cond, mask_weight=1.0):
+        """
+        Training loss: we predict the noise that was added.
+          x0: original clean image  (B,3,H,W)
+          t: diffusion timestep
+          cond: condition (partial_img + mask), shape (B,4,H,W)
+          mask_weight: optional weighting for the masked region
+
+        We create random noise, generate x_t, then the net predicts that noise.
+        Loss = MSE(predicted_noise, actual_noise).
+        """
+        noise = torch.randn_like(x0)
+        x_t = self.q_sample(x0, t, noise=noise)  # shape => (B,3,H,W)
+
+        # Predict noise with UNet
+        pred_noise = self.net(x_t, cond)         # also (B,3,H,W)
+
+        # MSE over all pixels
+        mse_per_pixel = F.mse_loss(pred_noise, noise, reduction='none')  # (B,3,H,W)
+
+        # Optionally emphasize the masked region
+        if mask_weight != 1.0 and cond.size(1) == 4:
+            real_mask = cond[:, 3:4, :, :]   # shape (B,1,H,W), 1=known, 0=hole
+            hole_mask = 1.0 - real_mask
+            hole_mask = hole_mask.repeat(1,3,1,1)
+            weighted_mse = mse_per_pixel * (1.0 + hole_mask * (mask_weight - 1.0))
+            return weighted_mse.mean()
+        else:
+            return mse_per_pixel.mean()
+
+    @torch.no_grad()
+    def p_sample(self, x_t, t, cond):
+        """
+        One step of reverse diffusion:
+          p(x_{t-1} | x_t) ~ N(mean, var)
+          mean = (1/sqrt(alpha_t)) [ x_t - ( (1-alpha_t)/sqrt(1-alpha_bar_t) ) * model_noise ]
+          var = posterior_variance[t]
+
+        Then clamp known region from cond (partial_img) if mask=1.
+        """
+        betas_t = self.betas[t]
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t]
+        sqrt_recip_alphas_t = 1.0 / torch.sqrt(self.alphas[t])
+        posterior_var_t = self.posterior_variance[t]
+
+        # model predicts noise
+        model_noise = self.net(x_t, cond)
+
+        # formula
+        x_pred = sqrt_recip_alphas_t * (
+            x_t - betas_t / sqrt_one_minus_alphas_cumprod_t * model_noise
+        )
+
+        if t > 0:
+            z = torch.randn_like(x_t)
+        else:
+            z = 0.0  # last step, no noise
+
+        x_t_next = x_pred + torch.sqrt(posterior_var_t) * z
+
+        # Hard inpainting step: clamp the known region
+        partial_img = cond[:, :3, :, :]
+        known_mask = cond[:, 3:4, :, :]
+        x_t_next = known_mask * partial_img + (1.0 - known_mask) * x_t_next
+
+        return x_t_next
+
+    @torch.no_grad()
+    def p_sample_loop(self, shape, cond):
+        """
+        Reverse diffusion from x_T ~ N(0,1) down to x_0.
+        shape: (B, 3, H, W)
+        cond:  (B, 4, H, W)
+        """
+        x = torch.randn(shape, device=self.device)
+        for i in reversed(range(self.timesteps)):
+            x = self.p_sample(x, i, cond)
+        return x
+
+
+# -----------------------------------------------------------------------------
+# 5) Training one epoch
+# -----------------------------------------------------------------------------
+def train_one_epoch(diffusion, model, dataloader, optimizer, device, max_grad_norm=1.0):
+    """
+    diffusion: the DiffusionModel object
+    model: the underlying UNet (model.net)
+    """
+    model.train()
+    total_loss = 0.0
     count = 0
 
-    # Wrap the dataloader with tqdm for a batch progress bar
     for partial_img, mask, gt_img in tqdm(dataloader, desc="Training", leave=False):
-        partial_img = partial_img.to(device)
-        mask = mask.to(device)
-        gt_img = gt_img.to(device)
+        partial_img = partial_img.to(device)  # (B,3,H,W)
+        mask = mask.to(device)               # (B,1,H,W)
+        gt_img = gt_img.to(device)           # (B,3,H,W)
 
-        # -------------------
-        # Train Discriminator
-        # -------------------
-        optD.zero_grad()
-        with torch.no_grad():
-            pred_img = gen(torch.cat([partial_img, mask], dim=1))
+        # Condition: cat(partial_img, mask) => (B,4,H,W)
+        cond = torch.cat([partial_img, mask], dim=1)
 
-        d_real = disc(gt_img)
-        loss_d_real = adversarial_loss(d_real, is_real=True)
+        # Random t
+        t = torch.randint(0, diffusion.timesteps, (partial_img.size(0),), device=device).long()
 
-        d_fake = disc(pred_img.detach())
-        loss_d_fake = adversarial_loss(d_fake, is_real=False)
+        optimizer.zero_grad()
 
-        lossD = 0.5 * (loss_d_real + loss_d_fake)
+        # Diffusion loss
+        loss = diffusion.p_losses(gt_img, t, cond, mask_weight=2.0)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
 
-        # Check for NaN
-        if torch.isnan(lossD):
-            print("Warning: D loss is NaN. Skipping D update.")
-        else:
-            lossD.backward()
-            # Gradient clipping
-            nn.utils.clip_grad_norm_(disc.parameters(), max_grad_norm)
-            optD.step()
-
-        # -------------------
-        # Train Generator
-        # -------------------
-        optG.zero_grad()
-        pred_img = gen(torch.cat([partial_img, mask], dim=1))
-        loss_rec = reconstruction_loss(pred_img, gt_img, mask)
-
-        d_fake_for_g = disc(pred_img)
-        loss_adv = adversarial_loss(d_fake_for_g, is_real=True)
-
-        lossG = lambda_rec * loss_rec + lambda_adv * loss_adv
-
-        if torch.isnan(lossG):
-            print("Warning: G loss is NaN. Skipping G update.")
-        else:
-            lossG.backward()
-            # Gradient clipping
-            nn.utils.clip_grad_norm_(gen.parameters(), max_grad_norm)
-            optG.step()
-
-        total_d_loss += lossD.item()
-        total_g_loss += lossG.item()
+        total_loss += loss.item()
         count += 1
 
-    avg_d_loss = total_d_loss / count
-    avg_g_loss = total_g_loss / count
-
-    return avg_g_loss, avg_d_loss
+    return total_loss / count
 
 
-# -------------------------------------------------------------------------
-# 7) Function to save example original/partial/reconstructed images
-# -------------------------------------------------------------------------
-def save_inpainting_examples(gen, dataset, device, epoch, num_examples=5, hole_size=8):
+# -----------------------------------------------------------------------------
+# 6) Function to save inpainting examples (sampling)
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def sample_inpainting_examples(diffusion, dataset, device, epoch, num_examples=3):
     """
-    Saves a grid of images showing partial images and their reconstructions.
-    num_examples = number of examples to visualize.
+    We'll pick random examples from the dataset, do reverse diffusion,
+    and save a grid: (Original, Partial, Inpainted).
     """
-    gen.eval()
-    
-    # We'll just pick a few random indices
     indices = torch.randint(len(dataset), size=(num_examples,))
+    fig, axes = plt.subplots(num_examples, 3, figsize=(10, 3 * num_examples))
+
+    diffusion.net.eval()
     
-    fig, axes = plt.subplots(num_examples, 3, figsize=(6, 2 * num_examples))
-    
-    with torch.no_grad():
-        for i, idx in enumerate(indices):
-            partial_img, mask, gt_img = dataset[idx]
-            # Move to device
-            partial_img = partial_img.unsqueeze(0).to(device)
-            mask = mask.unsqueeze(0).to(device)
-            gt_img = gt_img.unsqueeze(0).to(device)
+    for i, idx in enumerate(indices):
+        partial_img, mask, gt_img = dataset[idx]
+        partial_img = partial_img.unsqueeze(0).to(device)
+        mask = mask.unsqueeze(0).to(device)
+        gt_img = gt_img.unsqueeze(0).to(device)
 
-            # Generate inpainted image
-            pred_img = gen(torch.cat([partial_img, mask], dim=1))  # (B, 3, 32, 32)
+        _, h, w = gt_img.shape[-3:]  # (3,H,W)
 
-            # Move to CPU for plotting
-            partial_img = partial_img.cpu()
-            gt_img = gt_img.cpu()
-            pred_img = pred_img.cpu()
-            
-            # Plot original
-            axes[i, 0].imshow(gt_img.squeeze().permute(1, 2, 0).numpy())
-            axes[i, 0].set_title("Original")
-            axes[i, 0].axis('off')
-            
-            # Plot partial
-            axes[i, 1].imshow(partial_img.squeeze().permute(1, 2, 0).numpy())
-            axes[i, 1].set_title("Partial")
-            axes[i, 1].axis('off')
+        # Condition
+        cond = torch.cat([partial_img, mask], dim=1)  # (1,4,H,W)
 
-            # Plot prediction
-            axes[i, 2].imshow(pred_img.squeeze().permute(1, 2, 0).numpy())
-            axes[i, 2].set_title("Inpainted")
-            axes[i, 2].axis('off')
+        # Reverse diffusion
+        x_gen = diffusion.p_sample_loop(shape=(1,3,h,w), cond=cond)
+        final_img = x_gen  # known region is clamped inside p_sample_loop
+
+        # Move to CPU for plotting
+        partial_img = partial_img.cpu().squeeze()
+        gt_img = gt_img.cpu().squeeze()
+        final_img = final_img.cpu().squeeze()
+
+        # Plot original
+        axes[i, 0].imshow(gt_img.permute(1, 2, 0).numpy())
+        axes[i, 0].set_title("Original")
+        axes[i, 0].axis('off')
+
+        # Plot partial
+        axes[i, 1].imshow(partial_img.permute(1, 2, 0).numpy())
+        axes[i, 1].set_title("Partial")
+        axes[i, 1].axis('off')
+
+        # Plot final
+        axes[i, 2].imshow(final_img.permute(1, 2, 0).numpy())
+        axes[i, 2].set_title("Inpainted")
+        axes[i, 2].axis('off')
     
     plt.tight_layout()
-    out_name = f"examples_epoch_{epoch}.png"
+    out_name = f"diffusion_inpaint_epoch_{epoch}.png"
     plt.savefig(out_name)
     plt.close()
-    print(f"Saved example inpainting results to {out_name}")
+    print(f"Saved diffusion inpainting results to {out_name}")
 
 
+# -----------------------------------------------------------------------------
+# 7) Main function
+# -----------------------------------------------------------------------------
 def main():
     logging.basicConfig(level=logging.INFO)
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=str, default="Places365", 
+                        help="Root directory for Places365.")
+    parser.add_argument("--train", action="store_true", 
+                        help="Use the 'train-standard' split. Otherwise uses 'val'.")
+    parser.add_argument("--small", action="store_true",
+                        help="Use the 'small' version of Places365 (256x256).")
     parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--timesteps", type=int, default=200)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping max norm")
+    parser.add_argument("--img_size", type=int, default=256, 
+                        help="Resize images to this size if using the large dataset.")
+    parser.add_argument("--hole_size", type=int, default=64, help="Square hole size for inpainting.")
     args = parser.parse_args()
 
     device = torch.device(args.device)
 
-    # Models
-    gen = SimpleTransformerGenerator(
-        in_chans=4, out_chans=3,
-        img_size=32, patch_size=4,
-        embed_dim=192, depth=4, num_heads=6
-    ).to(device)
-
-    disc = SimpleDiscriminator(
-        in_channels=3, base_channels=64
-    ).to(device)
-
-    # Optimizers
-    optG = torch.optim.Adam(gen.parameters(), lr=args.lr, betas=(0.5, 0.999))
-    optD = torch.optim.Adam(disc.parameters(), lr=args.lr, betas=(0.5, 0.999))
-
-    # Optional scheduler for improved training stability
-    schedulerG = torch.optim.lr_scheduler.StepLR(optG, step_size=3, gamma=0.5)
-    schedulerD = torch.optim.lr_scheduler.StepLR(optD, step_size=3, gamma=0.5)
+    # If using the big dataset, let's definitely transform to 256x256. If 'small' is True, 
+    # they're already ~256 but we can still enforce transforms.
+    transform_list = []
+    if not args.small:
+        transform_list.append(transforms.Resize((args.img_size, args.img_size)))
+    transform_list.append(transforms.ToTensor())
+    transform = transforms.Compose(transform_list)
 
     # Dataset & DataLoader
-    transform = transforms.Compose([transforms.ToTensor()])
-    dataset = CIFAR10InpaintingDataset(
-        root="./data",
-        train=True,
+    dataset = Places365InpaintingDataset(
+        root=args.root,
+        train=args.train,
         transform=transform,
-        hole_size=8
+        hole_size=args.hole_size,
+        small=args.small
     )
-
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -391,53 +475,49 @@ def main():
         drop_last=True
     )
 
-    g_loss_history = []
-    d_loss_history = []
+    # Model + Diffusion
+    unet = SimpleUNet(in_channels=7, base_channels=64).to(device)
+    diffusion = DiffusionModel(net=unet, timesteps=args.timesteps, device=device)
+
+    # Optimizer
+    optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr)
+
+    loss_history = []
 
     # Training loop
     for epoch in range(1, args.epochs + 1):
         print(f"\n--- Epoch [{epoch}/{args.epochs}] ---")
-        g_loss, d_loss = train_one_epoch(
-            gen, disc, dataloader, optG, optD, device,
-            lambda_rec=1.0, lambda_adv=0.01,
+        train_loss = train_one_epoch(
+            diffusion, unet, dataloader, optimizer, device,
             max_grad_norm=args.max_grad_norm
         )
-        g_loss_history.append(g_loss)
-        d_loss_history.append(d_loss)
+        loss_history.append(train_loss)
 
-        logging.info(f"Epoch [{epoch}/{args.epochs}]  G Loss: {g_loss:.4f}  D Loss: {d_loss:.4f}")
+        logging.info(f"Epoch [{epoch}/{args.epochs}]  Diffusion Loss: {train_loss:.4f}")
 
-        # Update learning rate
-        schedulerG.step()
-        schedulerD.step()
+        # Save inpainting samples
+        sample_inpainting_examples(diffusion, dataset, device, epoch, num_examples=3)
 
-        # Save a few example reconstructions from this epoch
-        save_inpainting_examples(gen, dataset, device, epoch, num_examples=5, hole_size=8)
-
-        # Optionally save a checkpoint each epoch
-        checkpoint_path = f"checkpoint_epoch_{epoch}.pt"
+        # Save checkpoint
+        checkpoint_path = f"places365_diffusion_checkpoint_epoch_{epoch}.pt"
         torch.save({
             'epoch': epoch,
-            'gen_state_dict': gen.state_dict(),
-            'disc_state_dict': disc.state_dict(),
-            'optG_state_dict': optG.state_dict(),
-            'optD_state_dict': optD.state_dict(),
-            'g_loss_history': g_loss_history,
-            'd_loss_history': d_loss_history
+            'model_state_dict': unet.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss_history': loss_history
         }, checkpoint_path)
         logging.info(f"Checkpoint saved: {checkpoint_path}")
 
-    # Plot final G and D losses
+    # Plot final training loss
     plt.figure()
-    plt.plot(g_loss_history, label='Generator Loss')
-    plt.plot(d_loss_history, label='Discriminator Loss')
+    plt.plot(loss_history, label='Diffusion Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title('Training Losses')
+    plt.title('Training Loss (Diffusion Inpainting on Places365)')
     plt.legend()
-    plt.savefig('loss_plot.png')
+    plt.savefig('places365_diffusion_loss_plot.png')
     plt.close()
-    logging.info("Training complete. Loss plot saved to 'loss_plot.png'.")
+    logging.info("Training complete. Loss plot saved to places365_diffusion_loss_plot.png.")
 
 
 if __name__ == "__main__":
