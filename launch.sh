@@ -4,7 +4,7 @@
 export PYTHONUNBUFFERED=1
 
 # Define the number of GPUs to use
-WORLD_SIZE=6
+WORLD_SIZE=4
 
 # Check the number of available GPUs
 AVAILABLE_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
@@ -18,8 +18,7 @@ export MASTER_ADDR=localhost
 export MASTER_PORT=12355
 
 # Path to your training script
-# TRAIN_SCRIPT="train.py"
-TRAIN_SCRIPT="diffusion.py"
+TRAIN_SCRIPT="train.py"
 
 # Ensure the training script exists
 if [ ! -f "$TRAIN_SCRIPT" ]; then
@@ -27,8 +26,12 @@ if [ ! -f "$TRAIN_SCRIPT" ]; then
     exit 1
 fi
 
-# Build the command to run inside tmux
-CMD="python $TRAIN_SCRIPT"
+# Build the command to run (use torchrun)
+CMD="torchrun \
+  --nproc_per_node=$WORLD_SIZE \
+  --master_addr=$MASTER_ADDR \
+  --master_port=$MASTER_PORT \
+  $TRAIN_SCRIPT"
 
 # Launch the training in a tmux session named 'ddp_training'
 tmux new-session -d -s ddp_training "bash -c \"$CMD\" 2>&1 | tee terminal.txt"
@@ -38,4 +41,4 @@ echo "Training has been started in a tmux session named 'ddp_training'."
 echo "All outputs are being saved to 'terminal.txt'."
 echo "You can attach to the session using:"
 echo "    tmux attach-session -t ddp_training"
-echo "To detach from the session without stopping the training, press Ctrl+B followed by D."
+echo "To detach without stopping the training, press Ctrl+B followed by D."
