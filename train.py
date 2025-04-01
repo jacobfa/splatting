@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, utils
 
 # For progress bar
 from tqdm import tqdm
@@ -288,6 +288,59 @@ def train_one_epoch(gen, disc, dataloader, optG, optD, device,
     return avg_g_loss, avg_d_loss
 
 
+# -------------------------------------------------------------------------
+# 7) Function to save example original/partial/reconstructed images
+# -------------------------------------------------------------------------
+def save_inpainting_examples(gen, dataset, device, epoch, num_examples=5, hole_size=8):
+    """
+    Saves a grid of images showing partial images and their reconstructions.
+    num_examples = number of examples to visualize.
+    """
+    gen.eval()
+    
+    # We'll just pick a few random indices
+    indices = torch.randint(len(dataset), size=(num_examples,))
+    
+    fig, axes = plt.subplots(num_examples, 3, figsize=(6, 2 * num_examples))
+    
+    with torch.no_grad():
+        for i, idx in enumerate(indices):
+            partial_img, mask, gt_img = dataset[idx]
+            # Move to device
+            partial_img = partial_img.unsqueeze(0).to(device)
+            mask = mask.unsqueeze(0).to(device)
+            gt_img = gt_img.unsqueeze(0).to(device)
+
+            # Generate inpainted image
+            pred_img = gen(torch.cat([partial_img, mask], dim=1))  # (B, 3, 32, 32)
+
+            # Move to CPU for plotting
+            partial_img = partial_img.cpu()
+            gt_img = gt_img.cpu()
+            pred_img = pred_img.cpu()
+            
+            # Plot original
+            axes[i, 0].imshow(gt_img.squeeze().permute(1, 2, 0).numpy())
+            axes[i, 0].set_title("Original")
+            axes[i, 0].axis('off')
+            
+            # Plot partial
+            axes[i, 1].imshow(partial_img.squeeze().permute(1, 2, 0).numpy())
+            axes[i, 1].set_title("Partial")
+            axes[i, 1].axis('off')
+
+            # Plot prediction
+            axes[i, 2].imshow(pred_img.squeeze().permute(1, 2, 0).numpy())
+            axes[i, 2].set_title("Inpainted")
+            axes[i, 2].axis('off')
+    
+    plt.tight_layout()
+    out_name = f"examples_epoch_{epoch}.png"
+    plt.savefig(out_name)
+    plt.close()
+    print(f"Saved example inpainting results to {out_name}")
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
 
@@ -357,6 +410,9 @@ def main():
         # Update learning rate
         schedulerG.step()
         schedulerD.step()
+
+        # Save a few example reconstructions from this epoch
+        save_inpainting_examples(gen, dataset, device, epoch, num_examples=5, hole_size=8)
 
         # Optionally save a checkpoint each epoch
         checkpoint_path = f"checkpoint_epoch_{epoch}.pt"
